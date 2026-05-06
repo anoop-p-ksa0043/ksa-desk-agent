@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict
+
+import httpx
 
 from desk_agent.agent.prompts import SYSTEM_PROMPT, build_user_message
 from desk_agent.config import settings
 from desk_agent.logging import logger
 
-# Prefix for the claude.ai-hosted Zoho Desk MCP server
-_MCP_PREFIX = "mcp__claude_ai_anupz-corp-server1__"
+_MCP_SERVER_NAME = "zoho-desk"
+_MCP_PREFIX = f"mcp__{_MCP_SERVER_NAME}__"
 
-# Safe read + label + single-write tools only. Blocks reply, comment, delete, merge, etc.
 _ALLOWED_TOOLS = ",".join([
     f"{_MCP_PREFIX}ZohoDesk_getTicket",
     f"{_MCP_PREFIX}ZohoDesk_getThreads",
@@ -28,8 +30,35 @@ _ALLOWED_TOOLS = ",".join([
     f"{_MCP_PREFIX}ZohoDesk_getContact",
 ])
 
-# Project directory — claude --print must run here so MCP session is loaded
-_PROJECT_DIR = "/Users/anup/AI Workspace/ksa-desk-agent"
+_PROJECT_DIR = "/Users/anoop-ksa0043/AI Workspace/ksa-desk-agent"
+_ZOHO_TOKEN_URL = "https://accounts.zoho.sa/oauth/v2/token"
+
+
+async def _refresh_zoho_token() -> str | None:
+    """Exchange refresh token for a fresh access token. Returns the new token or None."""
+    if not all([settings.zoho_client_id, settings.zoho_client_secret, settings.zoho_refresh_token]):
+        return None
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            _ZOHO_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": settings.zoho_client_id,
+                "client_secret": settings.zoho_client_secret,
+                "refresh_token": settings.zoho_refresh_token,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json().get("access_token")
+
+
+def _update_mcp_token(access_token: str) -> None:
+    """Patch the Bearer token for zoho-desk in ~/.claude.json."""
+    claude_json = Path.home() / ".claude.json"
+    data = json.loads(claude_json.read_text())
+    data.setdefault("mcpServers", {}).setdefault(_MCP_SERVER_NAME, {}).setdefault("headers", {})
+    data["mcpServers"][_MCP_SERVER_NAME]["headers"]["Authorization"] = f"Bearer {access_token}"
+    claude_json.write_text(json.dumps(data, indent=2))
 
 
 async def run_triage(
@@ -38,19 +67,20 @@ async def run_triage(
     sender_domain: str,
     is_freemail: bool = False,
 ) -> None:
-    """
-    Runs the Claude Code CLI triage agent for a single ticket.
-    Uses the claude.ai session (no API key needed) with the anupz-corp-server1 MCP.
-    Handles domain labeling + triage in one pass.
-    Never raises — caller treats any exception as a non-fatal skip.
-    """
     log = logger.bind(ticket_id=ticket_id)
     log.info("agent_started", department_id=department_id, sender_domain=sender_domain)
 
+    # Refresh Zoho token before each run so the subprocess always has a valid token.
+    try:
+        new_token = await _refresh_zoho_token()
+        if new_token:
+            _update_mcp_token(new_token)
+            log.info("zoho_token_refreshed")
+    except Exception as exc:
+        log.warning("zoho_token_refresh_failed", error=str(exc))
+
     prompt = build_user_message(ticket_id, department_id, sender_domain, is_freemail)
 
-    # Prompt is passed via stdin — passing it as a positional arg after --allowedTools
-    # causes the variadic --allowedTools parser to consume it as another tool name.
     cmd = [
         settings.claude_bin, "--print",
         "--permission-mode", "bypassPermissions",
